@@ -15,6 +15,8 @@
 
 #include <atomic>
 #include <type_traits>
+#include <unordered_set>
+#include <mutex>
 
 using namespace std;
 
@@ -39,6 +41,31 @@ void* mi_malloc(size_t size) LIBC_FUN_ATTRS;
 void* mi_calloc(size_t count, size_t size) LIBC_FUN_ATTRS;
 void* mi_realloc(void* p, size_t newsize) LIBC_FUN_ATTRS;
 void mi_free(void* p) LIBC_FUN_ATTRS;
+}
+
+extern "C" {
+struct BlkInfo_
+{
+    void*  base;
+    size_t size;
+    uint   attr;
+};
+
+enum
+{
+    BLK_ATTR_FINALIZE = 0x01
+};
+
+void *gc_malloc(size_t sz, uint32_t ba = 0, const void *ti = nullptr);
+void *gc_calloc(size_t sz, uint32_t ba = 0, const void *ti = nullptr);
+BlkInfo_ gc_qalloc(size_t sz, uint32_t ba = 0, const void *ti = nullptr);
+void *gc_realloc(void* p, size_t sz, uint32_t ba = 0, const void *ti = nullptr);
+size_t gc_extend(void* p, size_t mx, size_t sz, const void *ti = nullptr);
+uint32_t gc_setAttr(void* p, uint32_t a);
+uint32_t gc_getAttr(void* p);
+uint32_t gc_clrAttr(void* p, uint32_t a);
+BlkInfo_ gc_query(void* p);
+void rt_finalizeFromGC(void* p, size_t size, uint32_t attr);
 }
 
 namespace {
@@ -112,6 +139,18 @@ HOOK(mi_malloc, HookType::Optional);
 HOOK(mi_calloc, HookType::Optional);
 HOOK(mi_realloc, HookType::Optional);
 HOOK(mi_free, HookType::Optional);
+
+// D GC functions
+HOOK(gc_malloc, HookType::Required);
+HOOK(gc_calloc, HookType::Required);
+HOOK(gc_qalloc, HookType::Required);
+HOOK(gc_realloc, HookType::Required);
+HOOK(gc_extend, HookType::Required);
+HOOK(rt_finalizeFromGC, HookType::Required);
+HOOK(gc_setAttr, HookType::Required);
+HOOK(gc_clrAttr, HookType::Required);
+HOOK(gc_getAttr, HookType::Required);
+HOOK(gc_query, HookType::Required);
 
 #pragma GCC diagnostic pop
 #undef HOOK
@@ -190,6 +229,18 @@ void init()
             hooks::mi_calloc.init();
             hooks::mi_realloc.init();
             hooks::mi_free.init();
+
+            // D GC functions
+            hooks::gc_malloc.init();
+            hooks::gc_calloc.init();
+            hooks::gc_qalloc.init();
+            hooks::gc_realloc.init();
+            hooks::gc_extend.init();
+            hooks::rt_finalizeFromGC.init();
+            hooks::gc_setAttr.init();
+            hooks::gc_clrAttr.init();
+            hooks::gc_getAttr.init();
+            hooks::gc_query.init();
 
             // cleanup environment to prevent tracing of child apps
             unsetenv("LD_PRELOAD");
@@ -430,5 +481,230 @@ void mi_free(void* ptr) LIBC_FUN_ATTRS
     heaptrack_free(ptr);
 
     hooks::mi_free(ptr);
+}
+
+/*
+ * The finalizer bit is set for every allocation on the D GC heap.
+ * This makes sure rt_finalizeFromGC is called for every freed pointer.
+ * Because the real rt_finalizeFromGC will crash for a pointer without
+ * a finalizer, we have to remember the pointers with a real finalizer
+ * in pointers_with_finalizer.
+ */
+static std::unordered_set<void*> pointers_with_finalizer;
+static std::mutex pointers_with_finalizer_mutex;
+
+/*
+ * The first allocations on the D GC heap uses ProtoGC, which
+ * initializes the real GC and forwards the call. This will look like
+ * two allocation and has to be handled specially.
+ */
+static thread_local int gc_recursive = 0;
+
+void *gc_malloc(size_t size, uint32_t ba, const void *ti)
+{
+    if (!hooks::gc_malloc) {
+        hooks::init();
+    }
+
+    gc_recursive++;
+    void* ptr = hooks::gc_malloc(size, ba, ti);
+    gc_recursive--;
+    if (gc_recursive) {
+        return ptr;
+    }
+
+    uint32_t attr = hooks::gc_getAttr(ptr);
+    if(attr & BLK_ATTR_FINALIZE) {
+        pointers_with_finalizer_mutex.lock();
+        pointers_with_finalizer.insert(ptr);
+        pointers_with_finalizer_mutex.unlock();
+    }
+    hooks::gc_setAttr(ptr, BLK_ATTR_FINALIZE);
+    heaptrack_malloc(ptr, size);
+    return ptr;
+}
+
+void *gc_calloc(size_t size, uint32_t ba, const void *ti)
+{
+    if (!hooks::gc_calloc) {
+        hooks::init();
+    }
+
+    gc_recursive++;
+    void* ptr = hooks::gc_calloc(size, ba, ti);
+    gc_recursive--;
+    if (gc_recursive) {
+        return ptr;
+    }
+
+    uint32_t attr = hooks::gc_getAttr(ptr);
+    if (attr & BLK_ATTR_FINALIZE) {
+        pointers_with_finalizer_mutex.lock();
+        pointers_with_finalizer.insert(ptr);
+        pointers_with_finalizer_mutex.unlock();
+    }
+    hooks::gc_setAttr(ptr, BLK_ATTR_FINALIZE);
+    heaptrack_malloc(ptr, size);
+    return ptr;
+}
+
+BlkInfo_ gc_qalloc(size_t size, uint32_t ba, const void *ti)
+{
+    if (!hooks::gc_qalloc) {
+        hooks::init();
+    }
+
+    gc_recursive++;
+    BlkInfo_ block = hooks::gc_qalloc(size, ba, ti);
+    gc_recursive--;
+    if(gc_recursive) {
+        return block;
+    }
+
+    uint32_t attr = hooks::gc_getAttr(block.base);
+    if (attr & BLK_ATTR_FINALIZE) {
+        pointers_with_finalizer_mutex.lock();
+        pointers_with_finalizer.insert(block.base);
+        pointers_with_finalizer_mutex.unlock();
+    }
+    hooks::gc_setAttr(block.base, BLK_ATTR_FINALIZE);
+    heaptrack_malloc(block.base, block.size);
+    return block;
+}
+
+void *gc_realloc(void* p, size_t size, uint32_t ba, const void *ti)
+{
+    if (!hooks::gc_realloc) {
+        hooks::init();
+    }
+
+    gc_recursive++;
+    void* ret = hooks::gc_realloc(p, size, ba, ti);
+    gc_recursive--;
+    if (gc_recursive) {
+        return ret;
+    }
+
+    if (ret) {
+        if (ret != p) {
+            pointers_with_finalizer_mutex.lock();
+            std::unordered_set<void*>::iterator it = pointers_with_finalizer.find(p);
+            if (it != pointers_with_finalizer.end()) {
+                pointers_with_finalizer.erase(it);
+                pointers_with_finalizer.insert(ret);
+            }
+            pointers_with_finalizer_mutex.unlock();
+        }
+        heaptrack_realloc(p, size, ret);
+    }
+    return ret;
+}
+
+size_t gc_extend(void* p, size_t mx, size_t sz, const void *ti)
+{
+    if (!hooks::gc_extend) {
+        hooks::init();
+    }
+
+    size_t ret = hooks::gc_extend(p, mx, sz, ti);
+    if (ret) {
+        heaptrack_realloc(p, ret, p);
+    }
+    return ret;
+}
+
+uint32_t gc_setAttr(void* p, uint32_t a)
+{
+    if (!hooks::gc_setAttr) {
+        hooks::init();
+    }
+
+    pointers_with_finalizer_mutex.lock();
+    bool hasFinalizer = pointers_with_finalizer.find(p) != pointers_with_finalizer.end();
+    if (a & BLK_ATTR_FINALIZE) {
+        pointers_with_finalizer.insert(p);
+    }
+    pointers_with_finalizer_mutex.unlock();
+
+    uint32_t r = hooks::gc_setAttr(p, a);
+    if (!hasFinalizer) {
+        r &= ~BLK_ATTR_FINALIZE;
+    }
+    return r;
+}
+
+uint32_t gc_clrAttr(void* p, uint32_t a)
+{
+    if (!hooks::gc_clrAttr) {
+        hooks::init();
+    }
+
+    pointers_with_finalizer_mutex.lock();
+    bool hasFinalizer = pointers_with_finalizer.find(p) != pointers_with_finalizer.end();
+    if (a & BLK_ATTR_FINALIZE) {
+        pointers_with_finalizer.erase(pointers_with_finalizer.find(p));
+    }
+    pointers_with_finalizer_mutex.unlock();
+
+    uint32_t r = hooks::gc_clrAttr(p, a & ~BLK_ATTR_FINALIZE);
+    if (!hasFinalizer) {
+        r &= ~BLK_ATTR_FINALIZE;
+    }
+    return r;
+}
+
+uint32_t gc_getAttr(void* p)
+{
+    if (!hooks::gc_getAttr) {
+        hooks::init();
+    }
+
+    pointers_with_finalizer_mutex.lock();
+    bool hasFinalizer = pointers_with_finalizer.find(p) != pointers_with_finalizer.end();
+    pointers_with_finalizer_mutex.unlock();
+
+    uint32_t r = hooks::gc_getAttr(p);
+    if (!hasFinalizer) {
+        r &= ~BLK_ATTR_FINALIZE;
+    }
+    return r;
+}
+
+BlkInfo_ gc_query(void* p)
+{
+    if (!hooks::gc_query) {
+        hooks::init();
+    }
+
+    pointers_with_finalizer_mutex.lock();
+    bool hasFinalizer = pointers_with_finalizer.find(p) != pointers_with_finalizer.end();
+    pointers_with_finalizer_mutex.unlock();
+
+    BlkInfo_ ret = hooks::gc_query(p);
+    if (!hasFinalizer) {
+        ret.attr &= ~BLK_ATTR_FINALIZE;
+    }
+    return ret;
+}
+
+void rt_finalizeFromGC(void* p, size_t size, uint32_t attr)
+{
+    if (!hooks::rt_finalizeFromGC) {
+        hooks::init();
+    }
+    heaptrack_free(p);
+
+    pointers_with_finalizer_mutex.lock();
+    std::unordered_set<void*>::iterator it = pointers_with_finalizer.find(p);
+    bool hasFinalizer = false;
+    if (it != pointers_with_finalizer.end()) {
+        pointers_with_finalizer.erase(it);
+        hasFinalizer = true;
+    }
+    pointers_with_finalizer_mutex.unlock();
+
+    if (hasFinalizer) {
+        hooks::rt_finalizeFromGC(p, size, attr);
+    }
 }
 }
